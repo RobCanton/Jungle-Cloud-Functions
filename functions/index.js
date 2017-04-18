@@ -11,28 +11,52 @@ const database = admin.database();
  * Followers add a flag to `/followers/{followedUid}/{followerUid}`.
  * Users save their device notification tokens to `/users/{followedUid}/notificationTokens/{notificationToken}`.
  */
+
+
+
 exports.sendFollowerNotification = functions.database.ref('/users/social/followers/{followedUid}/{followerUid}').onWrite(event => {
     const followerUid = event.params.followerUid;
     const followedUid = event.params.followedUid;
     const value = event.data.val();
 
-    var toRemove = false;
+    const followerFeedRef = database.ref(`/users/feed/following/${followerUid}/${followedUid}`);
+    
     if (value == null) {
-        toRemove = true;
+        return followerFeedRef.remove().then( error => {});
     }
+    
+    const getFollowerProfilePromise = database.ref(`/users/profile/${followerUid}/username/`).once('value');
+    
+    const getFollowedFCMTokenPromise = database.ref(`/users/FCMToken/${followedUid}`).once('value');
+    
+    const getFollowedStoryPromise = database.ref(`/users/story/${followedUid}`).once('value');
+    
+    return Promise.all([getFollowerProfilePromise, getFollowedFCMTokenPromise, getFollowedStoryPromise]).then(results => {
+        const profileSnapshot = results[0];
+        const tokenSnapshot = results[1];
+        const followedStory = results[2];
+        
+        console.log(`Followed: ${profileSnapshot.val()} | token: ${tokenSnapshot.val()}`);
+        
+        const updateFollowerFeedPromise = followerFeedRef.set(snapshot.val());
+        
+        return Promise.all([updateFollowerFeedPromise]).then(results => {
+            
+        });
+    });
 
-    const followedStoryRef = database.ref('/users/story/' + followedUid);
+    /*
 
     return followedStoryRef.once('value').then(snapshot => {
         if (snapshot.exists()) {
-            const followerFeedRef = database.ref('/users/feed/following/' + followerUid + '/' + followedUid + '/');
+            const followerFeedRef = database.ref(`/users/feed/following/${followerUid}/${followedUid}`);
             if (toRemove) {
                 return followerFeedRef.remove();
             }
             return followerFeedRef.set(snapshot.val());
         }
     });
-
+    */
     //return createFollowNotification(followerUid, followedUid);
 
 });
@@ -47,13 +71,13 @@ function createFollowNotification(sender, recipient) {
     // Custom key pattern so that all follow notifications are user -> user specific
     let nKey = "follow:" + sender;
 
-    notificationObject["notifications/" + nKey] = {
+    notificationObject[`notifications/${nKey}`] = {
         "type": 'FOLLOW',
         "sender": sender,
         "recipient": recipient,
         "timestamp": admin.database.ServerValue.TIMESTAMP
     }
-    notificationObject["users/notifications/" + recipient + "/" + nKey] = false;
+    notificationObject[`users/notifications/${recipient}/${nKey}`] = false;
 
     // Do a deep-path update
     return database.ref().update(notificationObject, function (error) {
@@ -87,7 +111,7 @@ exports.processUploads =
         const author = newData.author;
         const dateCreated = newData.dateCreated;
 
-        const followersRef = database.ref("users/social/followers/" + author);
+        const followersRef = database.ref(`users/social/followers/${author}`);
 
         return followersRef.once('value').then(snapshot => {
             if (snapshot.exists()) {
@@ -96,7 +120,7 @@ exports.processUploads =
                     const followerUid = follower.key;
                     console.log("Follower: ", followerUid);
 
-                    const tempRef = database.ref("users/social/stories/" + followerUid + '/' + author + '/' + uploadKey);
+                    const tempRef = database.ref(`users/social/stories/${followerUid}/${author}/${uploadKey}`);
                     tempRef.set(dateCreated);
 
                 });
@@ -107,17 +131,17 @@ exports.processUploads =
 function deletePost(key, author, placeId) {
     console.log("Delete post: ", key);
 
-    database.ref('places/' + placeId + '/posts/' + key).remove();
-    database.ref('users/story/' + author + '/' + key).remove();
-    database.ref('users/uploads/' + author + '/' + key).remove();
+    database.ref(`places/${placeId}/posts/${key}`).remove();
+    database.ref(`users/story/${author}/${key}`).remove();
+    database.ref(`users/uploads/${author}/${key}`).remove();
 
-    const postNotifications = database.ref('uploads/notifications/' + key);
+    const postNotifications = database.ref(`uploads/notifications/${key}`);
 
     return postNotifications.once('value').then(snapshot => {
         snapshot.forEach(function (notificationPair) {
             const notificationKey = notificationPair.key;
             const recipient = notificationPair.val();
-            database.ref('notifications/' + notificationKey).remove();
+            database.ref(`notifications/${notificationKey}`).remove();
         });
     });
 }
@@ -130,8 +154,8 @@ exports.processNotifications = functions.database.ref('/notifications/{notificat
     if (value == null && prevData !== null) {
         const postKey = prevData.postKey;
         const recipient = prevData.recipient;
-        database.ref('users/notifications/' + recipient + '/' + notificationKey).remove();
-        database.ref('uploads/notifications/' + postKey + '/' + notificationKey).remove();
+        database.ref(`users/notifications/${recipient}/${notificationKey}`).remove();
+        database.ref(`uploads/notifications/${postKey}/${notificationKey}`).remove();
         return console.log('Notification deleted: ', notificationKey);
     }
 
@@ -167,6 +191,7 @@ exports.locationUpdate = functions.database.ref('/users/location/coordinates/{ui
 
     const placesRef = database.ref('places');
 
+    console.log("Locations updated yadayadayada");
     var nearbyPlaceIds = {};
 
     return placesRef.once('value').then(snapshot => {
@@ -181,7 +206,7 @@ exports.locationUpdate = functions.database.ref('/users/location/coordinates/{ui
                 nearbyPlaceIds[id] = distance;
             }
         });
-        database.ref('users/location/nearby/' + userId + '/').set(nearbyPlaceIds);
+        database.ref(`users/location/nearby/${userId}/`).set(nearbyPlaceIds);
     });
 });
 
@@ -218,11 +243,11 @@ exports.nearbyStoriesUpdate =
         var updateObject = {}
 
         for (var i = 0; i < removedPlaces.length; i++) {
-            updateObject['lookups/userplace/' + removedPlaces[i] + '/' + userId] = null;
+            updateObject[`lookups/userplace/${removedPlaces[i]}/${userId}/`] = null;
         }
 
         for (var j = 0; j < addPlaces.length; j++) {
-            updateObject['lookups/userplace/' + addPlaces[j] + '/' + userId] = true;
+            updateObject[`lookups/userplace/${addPlaces[j]}/${userId}`] = true;
         }
 
         var placeIds = [];
@@ -230,7 +255,7 @@ exports.nearbyStoriesUpdate =
 
         Object.keys(newData).forEach(key => {
             placeIds.push(key);
-            const tempPromise = database.ref('/places/' + key + '/posts').once('value');
+            const tempPromise = database.ref(`/places/${key}/posts`).once('value');
             promises.push(tempPromise);
         });
 
@@ -241,7 +266,7 @@ exports.nearbyStoriesUpdate =
                 var result = results[i];
                 nearbyStories[placeIds[i]] = result.val();
             }
-            updateObject['users/feed/nearby/' + userId] = nearbyStories;
+            updateObject[`users/feed/nearby/${userId}`] = nearbyStories;
 
             // Do a deep-path update
             return database.ref().update(updateObject).then(error => {
@@ -276,7 +301,7 @@ exports.addNewPlace = functions.database.ref('/places/{placeId}/info').onWrite(e
             
             const distance = haversineDistance(lat, lon, place_lat, place_lon);
             if (distance <= rad) {
-                database.ref('users/location/nearby/' + userId + '/' + placeId).set(distance);
+                database.ref(`users/location/nearby/${userId}/${placeId}`).set(distance);
             }
         });
     });
@@ -288,7 +313,7 @@ exports.addPostToNearbyFeed =
         const postKey = event.params.postKey;
         const value = event.data.val();
         const newData = event.data._newData;
-        const lookupRef = database.ref('lookups/userplace/' + placeId);
+        const lookupRef = database.ref(`lookups/userplace/${placeId}`);
 
         var toRemove = false;
         if (value == null || newData == null) {
@@ -301,7 +326,7 @@ exports.addPostToNearbyFeed =
 
             snapshot.forEach(function (user) {
                 const userId = user.key;
-                const path = '/users/feed/nearby/' + userId + '/' + placeId + '/' + postKey;
+                const path = `/users/feed/nearby/${userId}/${placeId}/${postKey}`;
                 updateObject[path] = (toRemove ? null : newData);
             });
 
@@ -326,14 +351,14 @@ exports.addPostToFollowingFeed = functions.database.ref('/users/story/{uid}/{pos
         toRemove = true;
     }
 
-    const followersRef = database.ref('users/social/followers/' + userId);
+    const followersRef = database.ref(`users/social/followers/${userId}`);
 
     return followersRef.once('value').then(snapshot => {
         var updateObject = {};
 
         snapshot.forEach(function (user) {
             const followerId = user.key;
-            const path = '/users/feed/following/' + followerId + '/' + userId + '/' + postKey;
+            const path = `/users/feed/following/${followerId}/${userId}/${postKey}`;
             updateObject[path] = (toRemove ? null : newData);
         });
 
@@ -344,7 +369,6 @@ exports.addPostToFollowingFeed = functions.database.ref('/users/story/{uid}/{pos
             }
         });
     });
-
 });
 
 
