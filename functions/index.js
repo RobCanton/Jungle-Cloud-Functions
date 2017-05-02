@@ -1,3 +1,4 @@
+0
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 
@@ -20,52 +21,41 @@ exports.sendFollowerNotification = functions.database.ref('/users/social/followe
     const value = event.data.val();
 
     const followerFeedRef = database.ref(`/users/feed/following/${followerUid}/${followedUid}`);
-    
+
     if (value == null) {
-        return followerFeedRef.remove().then( error => {});
+        return followerFeedRef.remove().then(error => {});
     }
-    
-    const getFollowerProfilePromise = database.ref(`/users/profile/${followerUid}/username/`).once('value');
-    
-    const getFollowedFCMTokenPromise = database.ref(`/users/FCMToken/${followedUid}`).once('value');
-    
-    const getFollowedStoryPromise = database.ref(`/users/story/${followedUid}`).once('value');
-    
-    return Promise.all([getFollowerProfilePromise, getFollowedFCMTokenPromise, getFollowedStoryPromise]).then(results => {
-        const profileSnapshot = results[0];
-        const tokenSnapshot = results[1];
-        const followedStory = results[2];
-        
-        console.log(`Followed: ${profileSnapshot.val()} | token: ${tokenSnapshot.val()}`);
-        
-        const updateFollowerFeedPromise = followerFeedRef.set(snapshot.val());
-        
-        return Promise.all([updateFollowerFeedPromise]).then(results => {
-            
+
+    const promises = [
+        createFollowNotification(followerUid, followedUid),
+        database.ref(`/users/profile/${followerUid}/username/`).once('value'),
+        database.ref(`/users/FCMToken/${followedUid}`).once('value'),
+        database.ref(`/users/story/${followedUid}`).once('value')
+    ]
+
+    return Promise.all(promises).then(results => {
+        const setNotificationResult = results[0];
+        const username = results[1].val();
+        const token = results[2].val();
+        const followedStory = results[3].val();
+
+        const pushNotificationPayload = {
+            notification: {
+                body: `${username} started following you.`,
+            }
+        };
+
+        const sendPushNotification = admin.messaging().sendToDevice(token, pushNotificationPayload);
+        const updateFollowerFeedPromise = followerFeedRef.set(followedStory);
+
+        return Promise.all([sendPushNotification, updateFollowerFeedPromise]).then(results => {
+
         });
     });
-
-    /*
-
-    return followedStoryRef.once('value').then(snapshot => {
-        if (snapshot.exists()) {
-            const followerFeedRef = database.ref(`/users/feed/following/${followerUid}/${followedUid}`);
-            if (toRemove) {
-                return followerFeedRef.remove();
-            }
-            return followerFeedRef.set(snapshot.val());
-        }
-    });
-    */
-    //return createFollowNotification(followerUid, followedUid);
 
 });
 
 function createFollowNotification(sender, recipient) {
-    if (sender === recipient) {
-        return
-    }
-
     let notificationObject = {};
 
     // Custom key pattern so that all follow notifications are user -> user specific
@@ -80,29 +70,14 @@ function createFollowNotification(sender, recipient) {
     notificationObject[`users/notifications/${recipient}/${nKey}`] = false;
 
     // Do a deep-path update
-    return database.ref().update(notificationObject, function (error) {
-        if (error) {
-            console.log("Error updating data:", error);
-        }
-    });
+    return database.ref().update(notificationObject);
 };
-
-exports.sendMessageNotification =
-    functions.database.ref('/conversations/{conversationKey}/messages/{messageKey}').onWrite(event => {
-        const conversationKey = event.params.conversationKey;
-        const messageKey = event.params.messageKey;
-
-        console.log("Message: ", messageKey, " -> Conversation: ", conversationKey);
-    });
-
 exports.processUploads =
-    functions.database.ref('/uploads/data/{uploadKey}/meta').onWrite(event => {
+    functions.database.ref('/uploads/meta/{uploadKey}').onWrite(event => {
         const uploadKey = event.params.uploadKey;
         const value = event.data.val();
         const newData = event.data._newData;
         const prevData = event.data.previous._data;
-
-        console.log('upload: ', uploadKey, 'onWrite.');
 
         if (value == null) {
             return deletePost(uploadKey, prevData.author, prevData.placeID);
@@ -118,7 +93,6 @@ exports.processUploads =
 
                 snapshot.forEach(function (follower) {
                     const followerUid = follower.key;
-                    console.log("Follower: ", followerUid);
 
                     const tempRef = database.ref(`users/social/stories/${followerUid}/${author}/${uploadKey}`);
                     tempRef.set(dateCreated);
@@ -134,6 +108,7 @@ function deletePost(key, author, placeId) {
     database.ref(`places/${placeId}/posts/${key}`).remove();
     database.ref(`users/story/${author}/${key}`).remove();
     database.ref(`users/uploads/${author}/${key}`).remove();
+    database.ref(`uploads/comments/${key}`).remove();
 
     const postNotifications = database.ref(`uploads/notifications/${key}`);
 
@@ -162,19 +137,123 @@ exports.processNotifications = functions.database.ref('/notifications/{notificat
     return;
 });
 
-exports.sendCommentNotification = functions.database.ref('/uploads/data/{postKey}/comments/{commentKey}').onWrite(event => {
+exports.sendCommentNotification = functions.database.ref('/uploads/comments/{postKey}/{commentKey}').onWrite(event => {
     const postKey = event.params.postKey;
     const commentKey = event.params.commentKey;
     const value = event.data.val();
     const newData = event.data._newData;
 
-    if (value == null) {
-        return console.log('Comment deleted: ', commentKey);
+    if (value == null || newData == null) {
+        return;
     }
 
-    return console.log('Send comment notification.');
+    const sender = newData.author;
+
+    var usernameLookups = [];
+    var mentions = extractMentions(newData.text);
+    for (var i = 0; i < mentions.length; i++) {
+        mentions[i] = mentions[i].substring(1);
+        const username = mentions[i];
+        const lookupPromise = database.ref(`users/lookup/username/${mentions[i]}`).once('value');
+        usernameLookups.push(lookupPromise);
+    }
+
+    return Promise.all(usernameLookups).then(results => {
+        for (var j = 0; j < mentions.length; j++) {
+            const mention = mentions[j];
+            const result = results[j].val();
+
+            if (result == null) {
+                return event.data.ref.remove();
+            }
+
+            console.log("@", mention, " -> ", result);
+        }
+
+        console.log("Retrieved all mentioned user IDs.");
+
+        // CONTINUE
+
+        const postPromise = database.ref(`uploads/meta/${postKey}/author`).once('value');
+        const postCommentsPromise = database.ref(`/uploads/comments/${postKey}`).once('value');
+
+        return Promise.all([postPromise, postCommentsPromise]).then(results => {
+            let recipient = results[0].val();
+            let commentsResults = results[1];
+
+            if (recipient === sender) {
+                return
+            }
+
+            var promises = [
+                database.ref(`/users/profile/${sender}/username/`).once('value'),
+                database.ref(`/users/FCMToken/${recipient}`).once('value'),
+            ];
+
+            let notificationRef = database.ref(`users/notifications/${recipient}/`).push();
+            let notificationObject = {};
+            notificationObject[`notifications/${notificationRef.key}`] = {
+                "type": 'COMMENT',
+                "postKey": postKey,
+                "sender": sender,
+                "recipient": recipient,
+                "timestamp": admin.database.ServerValue.TIMESTAMP
+            }
+            notificationObject[`users/notifications/${recipient}/${notificationRef.key}`] = false;
+            const notificationPromise = database.ref().update(notificationObject);
+            promises.push(notificationPromise);
+
+            var numComments = 0;
+            if (commentsResults.exists()) {
+                numComments = commentsResults.numChildren()
+            }
+            const numCommentsPromise = database.ref(`/uploads/meta/${postKey}/comments`).set(numComments);
+            promises.push(numCommentsPromise);
+
+            return Promise.all(promises).then(results => {
+                const username = results[0].val();
+                const token = results[1].val();
+
+                console.log("username: ", username, " token: ", token);
+
+                var string = newData.text;
+                var length = 32;
+                var trimmedString = string.length > length ?
+                    string.substring(0, length - 3) + "..." :
+                    string;
+                const pushNotificationPayload = {
+                    notification: {
+                        body: `${username} commented on your post: "${trimmedString}"`
+                    }
+                };
+
+                const sendPushNotification = admin.messaging().sendToDevice(token, pushNotificationPayload);
+                return sendPushNotification.then(pushResult => {
+
+                });
+            });
+        });
+    });
+
 });
 
+exports.updateUploadViewsMeta = functions.database.ref('/uploads/views/{postKey}/{uid}').onWrite(event => {
+    const userId = event.params.uid;
+    const postKey = event.params.postKey;
+    const value = event.data.val();
+    const newData = event.data._newData;
+    var toRemove = false;
+    if (value == null) {
+        toRemove = true;
+    }
+
+    const postCommentsPromise = database.ref(`/uploads/views/${postKey}`).once('value');
+
+    return postCommentsPromise.then(snapshot => {
+        const numCommentsPromise = database.ref(`/uploads/meta/${postKey}/views`).set(snapshot.numChildren());
+        return numCommentsPromise.then(result => {});
+    });
+});
 
 exports.locationUpdate = functions.database.ref('/users/location/coordinates/{uid}').onWrite(event => {
     const userId = event.params.uid;
@@ -191,7 +270,6 @@ exports.locationUpdate = functions.database.ref('/users/location/coordinates/{ui
 
     const placesRef = database.ref('places');
 
-    console.log("Locations updated yadayadayada");
     var nearbyPlaceIds = {};
 
     return placesRef.once('value').then(snapshot => {
@@ -200,7 +278,7 @@ exports.locationUpdate = functions.database.ref('/users/location/coordinates/{ui
             const name = place.val().name;
             const place_lat = place.val().info.lat;
             const place_lon = place.val().info.lon;
-            //const posts = place.val().posts;
+
             var distance = haversineDistance(lat, lon, place_lat, place_lon);
             if (distance <= rad) {
                 nearbyPlaceIds[id] = distance;
@@ -217,6 +295,7 @@ exports.nearbyStoriesUpdate =
         const newData = event.data._newData;
         const prevData = event.data.previous._newData;
 
+
         var newPlaceIds = [];
         var oldPlaceIds = [];
 
@@ -228,26 +307,14 @@ exports.nearbyStoriesUpdate =
             newPlaceIds.push(key);
         });
 
-        oldPlaceIds.sort();
-        newPlaceIds.sort();
-
-        var removedPlaces = oldPlaceIds.filter(function (element) {
-            return !newPlaceIds.includes(element);
-        });
-
-        var addPlaces = newPlaceIds.filter(function (element) {
-            return !removedPlaces.includes(element);
-        });
-
-
         var updateObject = {}
 
-        for (var i = 0; i < removedPlaces.length; i++) {
-            updateObject[`lookups/userplace/${removedPlaces[i]}/${userId}/`] = null;
+        for (var i = 0; i < oldPlaceIds.length; i++) {
+            updateObject[`lookups/userplace/${oldPlaceIds[i]}/${userId}/`] = null;
         }
 
-        for (var j = 0; j < addPlaces.length; j++) {
-            updateObject[`lookups/userplace/${addPlaces[j]}/${userId}`] = true;
+        for (var j = 0; j < newPlaceIds.length; j++) {
+            updateObject[`lookups/userplace/${newPlaceIds[j]}/${userId}/`] = newData[newPlaceIds[j]];
         }
 
         var placeIds = [];
@@ -261,10 +328,18 @@ exports.nearbyStoriesUpdate =
 
         return Promise.all(promises).then(results => {
 
-            var nearbyStories = {}
+            var nearbyStories = {};
             for (var i = 0; i < results.length; i++) {
                 var result = results[i];
-                nearbyStories[placeIds[i]] = result.val();
+                var posts = result.val();
+                if (posts != null) {
+                    nearbyStories[placeIds[i]] = {
+                        "distance": newData[placeIds[i]],
+                        "posts": posts
+                    }
+                } else {
+                    nearbyStories[placeIds[i]] = null;
+                }
             }
             updateObject[`users/feed/nearby/${userId}`] = nearbyStories;
 
@@ -298,7 +373,7 @@ exports.addNewPlace = functions.database.ref('/places/{placeId}/info').onWrite(e
             const rad = userCoord.val().rad;
             const place_lat = newData.lat;
             const place_lon = newData.lon;
-            
+
             const distance = haversineDistance(lat, lon, place_lat, place_lon);
             if (distance <= rad) {
                 database.ref(`users/location/nearby/${userId}/${placeId}`).set(distance);
@@ -326,8 +401,10 @@ exports.addPostToNearbyFeed =
 
             snapshot.forEach(function (user) {
                 const userId = user.key;
-                const path = `/users/feed/nearby/${userId}/${placeId}/${postKey}`;
-                updateObject[path] = (toRemove ? null : newData);
+                const distance = user.val();
+                const userFeedPath = `/users/feed/nearby/${userId}/${placeId}`;
+                updateObject[`${userFeedPath}/posts/${postKey}`] = (toRemove ? null : newData);
+                updateObject[`${userFeedPath}/distance`] = distance;
             });
 
             // Do a deep-path update
@@ -362,6 +439,10 @@ exports.addPostToFollowingFeed = functions.database.ref('/users/story/{uid}/{pos
             updateObject[path] = (toRemove ? null : newData);
         });
 
+
+        const userPath = `/users/feed/myStory/${userId}/${userId}/${postKey}`;
+        updateObject[userPath] = (toRemove ? null : newData);
+
         // Do a deep-path update
         return database.ref().update(updateObject).then(error => {
             if (error) {
@@ -380,4 +461,112 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
         (1 - c((lon2 - lon1) * p)) / 2;
 
     return 12742 * Math.asin(Math.sqrt(a)); // 2 * R; R = 6371 km
+}
+
+exports.conversationMetaUpdate = functions.database.ref('/conversations/{conversationKey}/meta').onWrite(event => {
+    const conversationKey = event.params.conversationKey;
+    const value = event.data.val();
+    const prevData = event.data.previous._data;
+    const newData = event.data._newData;
+
+    const uids = conversationKey.split(":");
+    const uidA = uids[0];
+    const uidB = uids[1];
+
+
+    console.log("newData: ", newData);
+    var lastSeenA = newData[uidA];
+    const lastSeenB = newData[uidB];
+    const lastMessage = newData.latest;
+    const text = newData.text;
+
+    console.log(`lastSeenA: ${lastSeenA} lastSeenB: ${lastSeenB} lastest: ${lastMessage} text: ${text}`);
+
+    var updateObject = {};
+
+    if (lastSeenA == null || lastSeenA == undefined) {
+        return database.ref(`/conversations/${conversationKey}/meta/${uidA}`).set(0).then(result => {});
+        updateObject[`/conversations/${conversationKey}/meta/${uidA}`] = 0;
+    }
+
+    if (lastSeenB == null || lastSeenB == undefined) {
+        return database.ref(`/conversations/${conversationKey}/meta/${uidB}`).set(0).then(result => {});
+    }
+
+    console.log("Conversation meta is complete");
+
+    updateObject[`users/conversations/${uidA}/${uidB}/seen`] = lastSeenA >= lastMessage;
+    updateObject[`users/conversations/${uidA}/${uidB}/latest`] = lastMessage;
+    updateObject[`users/conversations/${uidA}/${uidB}/text`] = text;
+
+    updateObject[`users/conversations/${uidB}/${uidA}/seen`] = lastSeenB >= lastMessage;
+    updateObject[`users/conversations/${uidB}/${uidA}/latest`] = lastMessage;
+    updateObject[`users/conversations/${uidB}/${uidA}/text`] = text;
+
+    return database.ref().update(updateObject).then(result => {
+
+    });
+
+    return
+});
+
+exports.sendMessageNotification = functions.database.ref('/conversations/{conversationKey}/messages/{messageKey}').onWrite(event => {
+    const conversationKey = event.params.conversationKey;
+    const messageKey = event.params.messageKey;
+    const newData = event.data._newData;
+    console.log("Message: ", messageKey, " -> Conversation: ", conversationKey);
+
+    const senderId = newData.senderId;
+    const text = newData.text;
+    const timestamp = newData.timestamp;
+    if (newData == null || timestamp == null) {
+        return
+    }
+
+    const uids = conversationKey.split(":");
+    const uidA = uids[0];
+    const uidB = uids[1];
+
+    var recipientId = uidA;
+    if (recipientId == senderId) {
+        recipientId = uidB;
+    }
+
+    var metaObject = {}
+    metaObject[senderId] = timestamp;
+    metaObject["text"] = text;
+    metaObject["latest"] = timestamp;
+
+    const promises = [
+        event.data.ref.parent.parent.child("meta").update(metaObject),
+        database.ref(`/users/profile/${senderId}/username/`).once('value'),
+        database.ref(`/users/FCMToken/${recipientId}`).once('value'),
+    ];
+
+    return Promise.all(promises).then(results => {
+        const metaResults = results[0];
+        const username = results[1].val();
+        const token = results[2].val();
+
+        console.log("Meta: ", metaResults, " username: ", username, " token: ", token);
+
+        const pushNotificationPayload = {
+            notification: {
+                body: `${username}: ${text}`
+            }
+        };
+
+        const sendPushNotification = admin.messaging().sendToDevice(token, pushNotificationPayload);
+        return sendPushNotification.then(pushResult => {
+
+        });
+
+    });
+});
+
+function extractMentions(text) {
+    const pattern = /\B@[a-z0-9_-]+/gi;
+    let results = text.match(pattern);
+
+    return results != null ? results : [];
 }
