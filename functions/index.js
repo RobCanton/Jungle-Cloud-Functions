@@ -1,4 +1,3 @@
-0
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 
@@ -13,7 +12,7 @@ const database = admin.database();
  * Users save their device notification tokens to `/users/{followedUid}/notificationTokens/{notificationToken}`.
  */
 
-
+const notification_text_max_length = 32;
 
 exports.sendFollowerNotification = functions.database.ref('/users/social/followers/{followedUid}/{followerUid}').onWrite(event => {
     const followerUid = event.params.followerUid;
@@ -79,22 +78,27 @@ exports.processUserBlocked = functions.database.ref('/users/social/blocked/{uid}
     const uid = event.params.uid;
     const blocked_uid = event.params.blocked_uid;
     const value = event.data.val();
-    
+
     if (value == null) {
         return;
     }
-    
+
     const follow_ref_1 = database.ref(`users/social/followers/${uid}/${blocked_uid}`).remove();
     const follow_ref_2 = database.ref(`users/social/following/${uid}/${blocked_uid}`).remove();
     const follow_ref_3 = database.ref(`users/social/followers/${blocked_uid}/${uid}`).remove();
     const follow_ref_4 = database.ref(`users/social/following/${blocked_uid}/${uid}`).remove();
-    
+
     return Promise.all([follow_ref_1, follow_ref_2, follow_ref_3, follow_ref_4]).then(results => {
         console.log("Follow social removed");
-        
-        
+
+
     });
 });
+
+/*  Process Uploads
+    - If new post, add to follower feeds
+    - If removed post, remove from follower follower feeds
+*/
 
 exports.processUploads =
     functions.database.ref('/uploads/meta/{uploadKey}').onWrite(event => {
@@ -149,6 +153,7 @@ exports.processNotifications = functions.database.ref('/notifications/{notificat
     const notificationKey = event.params.notificationKey;
     const value = event.data.val();
     const prevData = event.data.previous._data;
+    const newData = event.data._newData;
 
     if (value == null && prevData !== null) {
         const postKey = prevData.postKey;
@@ -158,7 +163,41 @@ exports.processNotifications = functions.database.ref('/notifications/{notificat
         return console.log('Notification deleted: ', notificationKey);
     }
 
-    return;
+    const type = newData.type;
+    const sender = newData.sender;
+    const recipient = newData.recipient;
+    const text = newData.text;
+
+    console.log("New notification: ", type, " from ", sender, " to ", recipient);
+
+    const getSenderUsername = database.ref(`/users/profile/${sender}/username`).once('value');
+    const getRecipientToken = database.ref(`/users/FCMToken/${recipient}`).once('value');
+    return Promise.all([getSenderUsername, getRecipientToken]).then(results => {
+        const senderUsername = results[0].val();
+        const recipientToken = results[1].val();
+
+        var pushNotificationPayload = {};
+        if (type === "MENTION" && text !== null && text !== undefined) {
+            pushNotificationPayload = {
+                notification: {
+                    body: `${senderUsername} mentioned you in a comment: "${text}"`
+                }
+            };
+        } else if (type === "COMMENT" && text !== null && text !== undefined) {
+            pushNotificationPayload = {
+                notification: {
+                    body: `${senderUsername} commented on your post: "${text}"`
+                }
+            };
+        }
+
+        console.log("Send payload: ", pushNotificationPayload);
+
+        const sendPushNotification = admin.messaging().sendToDevice(recipientToken, pushNotificationPayload);
+        return sendPushNotification.then(pushResult => {
+            console.log("Push notification sent.");
+        });
+    });
 });
 
 exports.sendCommentNotification = functions.database.ref('/uploads/comments/{postKey}/{commentKey}').onWrite(event => {
@@ -190,7 +229,7 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
     for (var i = 0; i < mentions.length; i++) {
         mentions[i] = mentions[i].substring(1);
         const username = mentions[i];
-        const lookupPromise = database.ref(`users/lookup/username/${mentions[i]}`).once('value');
+        const lookupPromise = database.ref(`users/lookup/username/uid/${mentions[i]}`).once('value');
         usernameLookups.push(lookupPromise);
     }
 
@@ -226,21 +265,29 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
                 numComments = commentsResults.numChildren()
             }
             const numCommentsPromise = database.ref(`/uploads/meta/${postKey}/comments`).set(numComments);
-            
-            
+
+
             /*
                 Write comment notifications to post author and mentioned users 
             */
             let notificationObject = {};
-            
-            if (recipient !== sender) {
+
+            var string = newData.text;
+            var trimmedString = null;
+            if (string !== null && string !== undefined) {
+                trimmedString = string.length > notification_text_max_length ?
+                    string.substring(0, length - 3) + "..." : string;
+            }
+
+            if (recipient !== sender && trimmedString !== null) {
                 let notificationRef = database.ref(`users/notifications/${recipient}/`).push();
-                
+
                 notificationObject[`notifications/${notificationRef.key}`] = {
                     "type": 'COMMENT',
                     "postKey": postKey,
                     "sender": sender,
                     "recipient": recipient,
+                    "text": trimmedString,
                     "timestamp": admin.database.ServerValue.TIMESTAMP
                 }
                 notificationObject[`users/notifications/${recipient}/${notificationRef.key}`] = false;
@@ -248,7 +295,7 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
 
             for (var k = 0; k < mentioned_uids.length; k++) {
                 const mentioned_uid = mentioned_uids[k];
-                if (mentioned_uid !== sender && mentioned_uid !== recipient) {
+                if (mentioned_uid !== sender && mentioned_uid !== recipient && trimmedString !== null) {
 
                     let mentioned_notification_ref = database.ref(`users/notifications/${mentioned_uid}/`).push();
                     notificationObject[`notifications/${mentioned_notification_ref.key}`] = {
@@ -256,6 +303,7 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
                         "postKey": postKey,
                         "sender": sender,
                         "recipient": mentioned_uid,
+                        "text": trimmedString,
                         "timestamp": admin.database.ServerValue.TIMESTAMP
                     }
                     notificationObject[`users/notifications/${mentioned_uid}/${mentioned_notification_ref.key}`] = false;
@@ -385,35 +433,31 @@ exports.nearbyStoriesUpdate =
         return Promise.all(promises).then(results => {
             var blockedResults = results[0];
             var blocked_uids = {};
-            blockedResults.forEach(function(blocked_uid) {
+            blockedResults.forEach(function (blocked_uid) {
                 blocked_uids[blocked_uid.key] = true;
             });
-            
-            console.log("BLOCKED_UIDS: ", blocked_uids);
-            
+
             var nearbyStories = {};
             for (var i = 1; i < results.length; i++) {
                 const result = results[i];
-                const placeId = placeIds[i-1];
+                const placeId = placeIds[i - 1];
                 if (result.exists()) {
-                    
+
                     var filteredPosts = {};
-                    result.forEach(function(post) {
+                    result.forEach(function (post) {
                         const author = post.val().a;
                         const timestamp = post.val().t;
                         const blocked = blocked_uids[author];
-                        console.log("BLOCKED: ", blocked);
                         if (blocked == null || blocked == undefined) {
                             filteredPosts[post.key] = timestamp;
                         }
                     });
-                    console.log("FILTERED POSTS: ", filteredPosts);
                     if (filteredPosts != {}) {
-                        
+
                         nearbyStories[placeId] = {
                             "distance": newData[placeId],
                             "posts": filteredPosts
-                        } 
+                        }
                     }
                 } else {
                     nearbyStories[placeIds[i]] = null;
