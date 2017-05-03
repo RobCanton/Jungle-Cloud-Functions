@@ -30,7 +30,9 @@ exports.sendFollowerNotification = functions.database.ref('/users/social/followe
         createFollowNotification(followerUid, followedUid),
         database.ref(`/users/profile/${followerUid}/username/`).once('value'),
         database.ref(`/users/FCMToken/${followedUid}`).once('value'),
-        database.ref(`/users/story/${followedUid}`).once('value')
+        database.ref(`/users/story/${followedUid}`).once('value'),
+        database.ref(`/users/social/blocked/${followerUid}/${followedUid}`).remove(),
+        database.ref(`/users/social/blocked_by/${followedUid}/${followerUid}`).remove()
     ]
 
     return Promise.all(promises).then(results => {
@@ -72,6 +74,28 @@ function createFollowNotification(sender, recipient) {
     // Do a deep-path update
     return database.ref().update(notificationObject);
 };
+
+exports.processUserBlocked = functions.database.ref('/users/social/blocked/{uid}/{blocked_uid}').onWrite(event => {
+    const uid = event.params.uid;
+    const blocked_uid = event.params.blocked_uid;
+    const value = event.data.val();
+    
+    if (value == null) {
+        return;
+    }
+    
+    const follow_ref_1 = database.ref(`users/social/followers/${uid}/${blocked_uid}`).remove();
+    const follow_ref_2 = database.ref(`users/social/following/${uid}/${blocked_uid}`).remove();
+    const follow_ref_3 = database.ref(`users/social/followers/${blocked_uid}/${uid}`).remove();
+    const follow_ref_4 = database.ref(`users/social/following/${blocked_uid}/${uid}`).remove();
+    
+    return Promise.all([follow_ref_1, follow_ref_2, follow_ref_3, follow_ref_4]).then(results => {
+        console.log("Follow social removed");
+        
+        
+    });
+});
+
 exports.processUploads =
     functions.database.ref('/uploads/meta/{uploadKey}').onWrite(event => {
         const uploadKey = event.params.uploadKey;
@@ -144,7 +168,19 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
     const newData = event.data._newData;
 
     if (value == null || newData == null) {
-        return;
+        const postCommentsPromise = database.ref(`/uploads/comments/${postKey}`).once('value');
+
+        return postCommentsPromise.then(results => {
+
+            var numComments = 0;
+            if (results.exists()) {
+                numComments = results.numChildren()
+            }
+            const numCommentsPromise = database.ref(`/uploads/meta/${postKey}/comments`).set(numComments);
+            return numCommentsPromise.then(result => {
+
+            });
+        });
     }
 
     const sender = newData.author;
@@ -159,6 +195,8 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
     }
 
     return Promise.all(usernameLookups).then(results => {
+
+        var mentioned_uids = [];
         for (var j = 0; j < mentions.length; j++) {
             const mention = mentions[j];
             const result = results[j].val();
@@ -166,8 +204,7 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
             if (result == null) {
                 return event.data.ref.remove();
             }
-
-            console.log("@", mention, " -> ", result);
+            mentioned_uids.push(result);
         }
 
         console.log("Retrieved all mentioned user IDs.");
@@ -181,38 +218,55 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
             let recipient = results[0].val();
             let commentsResults = results[1];
 
-            if (recipient === sender) {
-                return
-            }
-
-            var promises = [
-                database.ref(`/users/profile/${sender}/username/`).once('value'),
-                database.ref(`/users/FCMToken/${recipient}`).once('value'),
-            ];
-
-            let notificationRef = database.ref(`users/notifications/${recipient}/`).push();
-            let notificationObject = {};
-            notificationObject[`notifications/${notificationRef.key}`] = {
-                "type": 'COMMENT',
-                "postKey": postKey,
-                "sender": sender,
-                "recipient": recipient,
-                "timestamp": admin.database.ServerValue.TIMESTAMP
-            }
-            notificationObject[`users/notifications/${recipient}/${notificationRef.key}`] = false;
-            const notificationPromise = database.ref().update(notificationObject);
-            promises.push(notificationPromise);
-
+            /*
+                Update post meta with number of comments 
+            */
             var numComments = 0;
             if (commentsResults.exists()) {
                 numComments = commentsResults.numChildren()
             }
             const numCommentsPromise = database.ref(`/uploads/meta/${postKey}/comments`).set(numComments);
-            promises.push(numCommentsPromise);
+            
+            
+            /*
+                Write comment notifications to post author and mentioned users 
+            */
+            let notificationObject = {};
+            
+            if (recipient !== sender) {
+                let notificationRef = database.ref(`users/notifications/${recipient}/`).push();
+                
+                notificationObject[`notifications/${notificationRef.key}`] = {
+                    "type": 'COMMENT',
+                    "postKey": postKey,
+                    "sender": sender,
+                    "recipient": recipient,
+                    "timestamp": admin.database.ServerValue.TIMESTAMP
+                }
+                notificationObject[`users/notifications/${recipient}/${notificationRef.key}`] = false;
+            }
 
-            return Promise.all(promises).then(results => {
-                const username = results[0].val();
-                const token = results[1].val();
+            for (var k = 0; k < mentioned_uids.length; k++) {
+                const mentioned_uid = mentioned_uids[k];
+                if (mentioned_uid !== sender && mentioned_uid !== recipient) {
+
+                    let mentioned_notification_ref = database.ref(`users/notifications/${mentioned_uid}/`).push();
+                    notificationObject[`notifications/${mentioned_notification_ref.key}`] = {
+                        "type": 'MENTION',
+                        "postKey": postKey,
+                        "sender": sender,
+                        "recipient": mentioned_uid,
+                        "timestamp": admin.database.ServerValue.TIMESTAMP
+                    }
+                    notificationObject[`users/notifications/${mentioned_uid}/${mentioned_notification_ref.key}`] = false;
+                }
+            }
+
+            const notificationPromise = database.ref().update(notificationObject);
+
+            return Promise.all([numCommentsPromise, notificationPromise]).then(results => {
+                /*const username = results[0].val();
+                
 
                 console.log("username: ", username, " token: ", token);
 
@@ -226,11 +280,11 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
                         body: `${username} commented on your post: "${trimmedString}"`
                     }
                 };
-
+                
                 const sendPushNotification = admin.messaging().sendToDevice(token, pushNotificationPayload);
                 return sendPushNotification.then(pushResult => {
 
-                });
+                });*/
             });
         });
     });
@@ -318,7 +372,9 @@ exports.nearbyStoriesUpdate =
         }
 
         var placeIds = [];
-        var promises = [];
+        var promises = [
+            database.ref(`users/social/blocked/${userId}`).once('value')
+        ];
 
         Object.keys(newData).forEach(key => {
             placeIds.push(key);
@@ -327,15 +383,37 @@ exports.nearbyStoriesUpdate =
         });
 
         return Promise.all(promises).then(results => {
-
+            var blockedResults = results[0];
+            var blocked_uids = {};
+            blockedResults.forEach(function(blocked_uid) {
+                blocked_uids[blocked_uid.key] = true;
+            });
+            
+            console.log("BLOCKED_UIDS: ", blocked_uids);
+            
             var nearbyStories = {};
-            for (var i = 0; i < results.length; i++) {
-                var result = results[i];
-                var posts = result.val();
-                if (posts != null) {
-                    nearbyStories[placeIds[i]] = {
-                        "distance": newData[placeIds[i]],
-                        "posts": posts
+            for (var i = 1; i < results.length; i++) {
+                const result = results[i];
+                const placeId = placeIds[i-1];
+                if (result.exists()) {
+                    
+                    var filteredPosts = {};
+                    result.forEach(function(post) {
+                        const author = post.val().a;
+                        const timestamp = post.val().t;
+                        const blocked = blocked_uids[author];
+                        console.log("BLOCKED: ", blocked);
+                        if (blocked == null || blocked == undefined) {
+                            filteredPosts[post.key] = timestamp;
+                        }
+                    });
+                    console.log("FILTERED POSTS: ", filteredPosts);
+                    if (filteredPosts != {}) {
+                        
+                        nearbyStories[placeId] = {
+                            "distance": newData[placeId],
+                            "posts": filteredPosts
+                        } 
                     }
                 } else {
                     nearbyStories[placeIds[i]] = null;
