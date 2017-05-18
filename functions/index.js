@@ -12,7 +12,7 @@ exports.removePostData = functions.database.ref('/admin/remove').onWrite(event =
     if (value == null) {
         return
     }
-    
+
     const r1 = database.ref(`uploads`).remove();
     const r2 = database.ref(`places`).remove();
     const r3 = database.ref(`stories`).remove();
@@ -20,9 +20,11 @@ exports.removePostData = functions.database.ref('/admin/remove').onWrite(event =
     const r5 = database.ref(`users/feed`).remove();
     const r6 = database.ref(`users/location`).remove();
     const r7 = database.ref(`users/uploads`).remove();
-    
-    return Promise.all([r1, r2, r3, r4, r5, r6, r7]).then( event => {
-        
+    const r8 = database.ref(`users/viewed`).remove();
+    const r9 = database.ref(`users/notifications`).remove();
+    const r10 = database.ref(`notifications`).remove();
+    return Promise.all([r1, r2, r3, r4, r5, r6, r7, r8, r9, r10]).then(event => {
+
     });
 })
 
@@ -48,17 +50,20 @@ exports.runCleanUp = functions.database.ref('/admin/cleanup').onWrite(event => {
 
             if (age >= 1440) {
                 if (place !== null || place !== undefined) {
-                    updateObject[`places/${place}/posts/${key}`] = null;
+                    updateObject[`stories/stats/places/${place}/posts/${key}`] = null;
                 }
 
-                updateObject[`users/story/${author}/posts/${key}`] = null;
+                updateObject[`stories/stats/users/${author}/posts/${key}`] = null;
                 updateObject[`uploads/live/${key}`] = null;
                 updateObject[`uploads/meta/${key}/live`] = false;
+
+                clearViews(key);
             }
         });
 
         const removeCleanup = database.ref(`admin/cleanup`).remove();
         const update = database.ref().update(updateObject);
+
 
         return Promise.all([removeCleanup, update]).then(snapshot => {
             const updateResult = snapshot[1];
@@ -70,6 +75,17 @@ exports.runCleanUp = functions.database.ref('/admin/cleanup').onWrite(event => {
         console.log("Promise rejected: " + error);
     });
 });
+
+function clearViews(postKey) {
+    const getViews = database.ref(`uploads/views/${postKey}`);
+
+    return getViews.then(snapshot => {
+        snapshot.forEach(function (uid) {
+            database.ref(`users/viewed/${uid}/${postKey}`).remove();
+        });
+
+    });
+}
 
 /**
  * Triggers when a user gets a new follower and sends a notification.
@@ -83,6 +99,8 @@ exports.sendFollowerNotification = functions.database.ref('/users/social/followe
     const followerUid = event.params.followerUid;
     const followedUid = event.params.followedUid;
     const value = event.data.val();
+
+    updateFollowerCounts(followerUid, followedUid);
 
     const followerFeedRef = database.ref(`/users/feed/following/${followerUid}/${followedUid}`);
 
@@ -106,7 +124,7 @@ exports.sendFollowerNotification = functions.database.ref('/users/social/followe
     const promises = [
         database.ref().update(notificationObject),
         database.ref(`/users/profile/${followerUid}/username/`).once('value'),
-        database.ref(`/users/story/${followedUid}/posts`).once('value'),
+        database.ref(`/stories/users/${followedUid}/posts`).once('value'),
         database.ref(`/users/social/blocked/${followerUid}/${followedUid}`).remove(),
         database.ref(`/users/social/blocked_by/${followedUid}/${followerUid}`).remove()
     ];
@@ -128,6 +146,25 @@ exports.sendFollowerNotification = functions.database.ref('/users/social/followe
     });
 
 });
+
+
+function updateFollowerCounts(followerUid, followedUid) {
+
+    const follower_count = database.ref(`users/social/following/${followerUid}`).once('value');
+    const followed_count = database.ref(`users/social/followers/${followedUid}`).once('value');
+
+    return Promise.all([follower_count, followed_count]).then(results => {
+        const following = results[0];
+        const followers = results[1];
+
+        const setFollowingCount = database.ref(`users/profile/${followerUid}/following`).set(following.numChildren());
+        const setFollowersCount = database.ref(`users/profile/${followedUid}/followers`).set(followers.numChildren());
+
+        return Promise.all([setFollowingCount, setFollowersCount]).then(results => {
+
+        });
+    });
+}
 
 exports.processUserBlocked = functions.database.ref('/users/social/blocked/{uid}/{blocked_uid}').onWrite(event => {
     const uid = event.params.uid;
@@ -201,14 +238,17 @@ exports.processUploads =
 function deletePost(key, author, placeId) {
     console.log("Delete post: ", key);
 
-    database.ref(`places/${placeId}/posts/${key}`).remove();
-    database.ref(`users/story/${author}/posts/${key}`).remove();
+    if (placeId !== null || placeId !== undefined) {
+        database.ref(`stories/stats/places/${placeId}/posts/${key}`).remove();
+    }
+
+    database.ref(`stories/stats/users/${author}/posts/${key}`).remove();
     database.ref(`users/uploads/${author}/${key}`).remove();
     database.ref(`uploads/comments/${key}`).remove();
 
     const postNotifications = database.ref(`uploads/notifications/${key}`);
 
-    return postNotifications.once('value').then(snapshot => {
+    return Promise.all([]).once('value').then(snapshot => {
         snapshot.forEach(function (notificationPair) {
             const notificationKey = notificationPair.key;
             const recipient = notificationPair.val();
@@ -240,39 +280,51 @@ exports.processNotifications = functions.database.ref('/notifications/{notificat
 
     console.log("New notification: ", type, " from ", sender, " to ", recipient);
 
-    const getSenderUsername = database.ref(`/users/profile/${sender}/username`).once('value');
-    const getRecipientToken = database.ref(`/users/FCMToken/${recipient}`).once('value');
-    return Promise.all([getSenderUsername, getRecipientToken]).then(results => {
-        const senderUsername = results[0].val();
-        const recipientToken = results[1].val();
 
-        var pushNotificationPayload = {};
-        if (type === "FOLLOW") {
-            pushNotificationPayload = {
-                notification: {
-                    body: `${senderUsername} started following you.`,
-                }
-            };
+    const getRecipientSettings = database.ref(`/users/settings/${recipient}/push_notifications`).once('value');
+    return getRecipientSettings.then(snapshot => {
 
-        } else if (type === "MENTION" && text !== null && text !== undefined) {
-            pushNotificationPayload = {
-                notification: {
-                    body: `${senderUsername} mentioned you in a comment: "${text}"`
-                }
-            };
-        } else if (type === "COMMENT" && text !== null && text !== undefined) {
-            pushNotificationPayload = {
-                notification: {
-                    body: `${senderUsername} commented on your post: "${text}"`
-                }
-            };
+        if (snapshot.exists() && !snapshot.val()) {
+            return
         }
 
-        console.log("Send payload: ", pushNotificationPayload);
+        const getSenderUsername = database.ref(`/users/profile/${sender}/username`).once('value');
+        const getRecipientToken = database.ref(`/users/FCMToken/${recipient}`).once('value');
 
-        const sendPushNotification = admin.messaging().sendToDevice(recipientToken, pushNotificationPayload);
-        return sendPushNotification.then(pushResult => {
-            console.log("Push notification sent.");
+        return Promise.all([getSenderUsername, getRecipientToken]).then(results => {
+            const senderUsername = results[0].val();
+            const recipientToken = results[1].val();
+
+            var pushNotificationPayload = {};
+            if (type === "FOLLOW") {
+                pushNotificationPayload = {
+                    notification: {
+                        body: `${senderUsername} started following you.`,
+                    }
+                };
+
+            } else if (type === "MENTION" && text !== null && text !== undefined) {
+                pushNotificationPayload = {
+                    notification: {
+                        body: `${senderUsername} mentioned you in a comment: "${text}"`
+                    }
+                };
+            } else if (type === "COMMENT" && text !== null && text !== undefined) {
+                pushNotificationPayload = {
+                    notification: {
+                        body: `${senderUsername} commented on your post: "${text}"`
+                    }
+                };
+            }
+
+            console.log("Send payload: ", pushNotificationPayload);
+
+            const sendPushNotification = admin.messaging().sendToDevice(recipientToken, pushNotificationPayload);
+            return sendPushNotification.then(pushResult => {
+                console.log("Push notification sent.");
+            }).catch(function (error) {
+                console.log("Promise rejected: " + error);
+            });
         }).catch(function (error) {
             console.log("Promise rejected: " + error);
         });
@@ -316,6 +368,7 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
         const postMeta = results[0].val();
         const postAuthor = postMeta.author;
         const live = postMeta.live;
+        const placeId = postMeta.placeID;
         const commentsResults = results[1];
         const subscribersResults = results[2];
 
@@ -341,8 +394,13 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
         metaUpdateObject[`/uploads/meta/${postKey}/commenters`] = commenters.length;
 
         if (live) {
-            metaUpdateObject[`/users/story/${postAuthor}/posts/${postKey}/c`] = numComments;
-            metaUpdateObject[`/users/story/${postAuthor}/posts/${postKey}/p`] = participants;
+            metaUpdateObject[`/stories/stats/users/${postAuthor}/posts/${postKey}/c`] = numComments;
+            metaUpdateObject[`/stories/stats/users/${postAuthor}/posts/${postKey}/p`] = participants;
+
+            if (placeId !== null && placeId !== undefined) {
+                metaUpdateObject[`/places/${placeId}/posts/${postKey}/c`] = numComments;
+                metaUpdateObject[`/places/${placeId}/posts/${postKey}/p`] = participants;
+            }
         }
         const metaUpdatePromise = database.ref().update(metaUpdateObject);
 
@@ -418,21 +476,28 @@ exports.updateViewsMeta = functions.database.ref('/uploads/views/{postKey}/{uid}
     const postDataPromise = database.ref(`/uploads/meta/${postKey}`).once('value');
     const postViewsPromise = database.ref(`/uploads/views/${postKey}`).once('value');
 
-    return Promise.all([postDataPromise, postViewsPromise]).then( results => {
-        const postData = results[0].val();
-        const postViews  = results[1];
-        
+    return Promise.all([postDataPromise, postViewsPromise]).then(results => {
+        const postMeta = results[0].val();
+        const postViews = results[1];
+        const author = postMeta.author;
+        const live = postMeta.live;
+        const placeId = postMeta.placeID;
+
         var metaUpdateObject = {};
         metaUpdateObject[`/uploads/meta/${postKey}/views`] = postViews.numChildren();
-        
-        if (postData.live && postViews.val() !== null && postViews.val() !== undefined) {
-            metaUpdateObject[`/users/story/${postData.author}/posts/${postKey}/v`] = postViews.val();
+
+        if (live && postViews.val() !== null && postViews.val() !== undefined) {
+            metaUpdateObject[`/stories/stats/users/${author}/posts/${postKey}/v`] = postViews.val();
+
+            if (placeId !== null && placeId !== undefined) {
+                metaUpdateObject[`/stories/stats/places/${placeId}/posts/${postKey}/v`] = postViews.val();
+            }
         }
-        
+
         const metaUpdatePromise = database.ref().update(metaUpdateObject);
-        
+
         return metaUpdatePromise.then(result => {
-            
+
         }).catch(function (error) {
             console.log("Promise rejected: " + error);
         });
@@ -454,234 +519,61 @@ exports.locationUpdate = functions.database.ref('/users/location/coordinates/{ui
         return console.log('Location removed: ', userId);
     }
 
-    const placesRef = database.ref('places');
+    const placesRef = database.ref('places').once('value');
+    const userCoordsRef = database.ref('stories/sorted/coordinates').once('value');
+    const followingRef = database.ref(`users/social/following/${userId}/`).once('value');
 
-    var nearbyPlaceIds = {};
+    return Promise.all([followingRef, userCoordsRef, placesRef]).then(results => {
+        const followingSnapshot = results[0];
+        const usersSnapshot = results[1];
+        const placesSnapshot = results[2];
 
-    return placesRef.once('value').then(snapshot => {
-        snapshot.forEach(function (place) {
+        var following = {};
+        var followingWithNearbyStories = {};
+        followingSnapshot.forEach(function (user) {
+            following[user.key] = true;
+        });
+
+        var nearbyUserIds = {};
+
+        usersSnapshot.forEach(function (user) {
+            const uid = user.key;
+            const user_lat = user.val().lat;
+            const user_lon = user.val().lon;
+
+            const distance = utilities.haversineDistance(lat, lon, user_lat, user_lon);
+            if (distance <= rad && uid !== userId) {
+                nearbyUserIds[uid] = distance;
+                if (following[uid] !== null && following[uid] !== undefined) {
+                    followingWithNearbyStories[uid] = distance;
+                }
+            }
+        });
+
+        var nearbyPlaceIds = {};
+
+        placesSnapshot.forEach(function (place) {
             const id = place.key;
             const name = place.val().name;
             const place_lat = place.val().info.lat;
             const place_lon = place.val().info.lon;
 
-            var distance = utilities.haversineDistance(lat, lon, place_lat, place_lon);
+            const distance = utilities.haversineDistance(lat, lon, place_lat, place_lon);
             if (distance <= rad) {
                 nearbyPlaceIds[id] = distance;
             }
         });
-        const setNearbyIdsPromise = database.ref(`users/location/nearby/${userId}/`).set(nearbyPlaceIds);
-        return setNearbyIdsPromise.then(result => {
 
-        }).catch(function (error) {
-            console.log("Promise rejected: " + error);
+        var nearbyUpdateObject = {};
+
+        nearbyUpdateObject[`users/location/nearby/${userId}/following`] = followingWithNearbyStories;
+        nearbyUpdateObject[`users/location/nearby/${userId}/users`] = nearbyUserIds;
+        nearbyUpdateObject[`users/location/nearby/${userId}/places`] = nearbyPlaceIds;
+        const updatePromise = database.ref().update(nearbyUpdateObject);
+        return updatePromise.then(result => {
+
         });
 
-    }).catch(function (error) {
-        console.log("Promise rejected: " + error);
-    });
-});
-
-
-
-
-
-
-
-exports.nearbyStoriesUpdate =
-    functions.database.ref('/users/location/nearby/{uid}').onWrite(event => {
-        const userId = event.params.uid;
-        const value = event.data.val();
-        const newData = event.data._newData;
-        const prevData = event.data.previous._newData;
-
-
-        var newPlaceIds = [];
-        var oldPlaceIds = [];
-
-        Object.keys(prevData).forEach(key => {
-            oldPlaceIds.push(key);
-        });
-
-        Object.keys(newData).forEach(key => {
-            newPlaceIds.push(key);
-        });
-
-        var updateObject = {}
-
-        for (var i = 0; i < oldPlaceIds.length; i++) {
-            updateObject[`lookups/userplace/${oldPlaceIds[i]}/${userId}/`] = null;
-        }
-
-        for (var j = 0; j < newPlaceIds.length; j++) {
-            updateObject[`lookups/userplace/${newPlaceIds[j]}/${userId}/`] = newData[newPlaceIds[j]];
-        }
-
-        var placeIds = [];
-        var promises = [
-            database.ref(`users/social/blocked/${userId}`).once('value')
-        ];
-
-        Object.keys(newData).forEach(key => {
-            placeIds.push(key);
-            const tempPromise = database.ref(`/places/${key}/posts`).once('value');
-            promises.push(tempPromise);
-        });
-
-        return Promise.all(promises).then(results => {
-            var blockedResults = results[0];
-            var blocked_uids = {};
-            blockedResults.forEach(function (blocked_uid) {
-                blocked_uids[blocked_uid.key] = true;
-            });
-
-            var nearbyStories = {};
-            for (var i = 1; i < results.length; i++) {
-                const result = results[i];
-                const placeId = placeIds[i - 1];
-                if (result.exists()) {
-
-                    var filteredPosts = {};
-                    result.forEach(function (post) {
-                        const author = post.val().a;
-                        const timestamp = post.val().t;
-                        const blocked = blocked_uids[author];
-                        if (blocked == null || blocked == undefined) {
-                            filteredPosts[post.key] = timestamp;
-                        }
-                    });
-                    if (filteredPosts != {}) {
-
-                        nearbyStories[placeId] = {
-                            "distance": newData[placeId],
-                            "posts": filteredPosts
-                        }
-                    }
-                } else {
-                    nearbyStories[placeIds[i]] = null;
-                }
-            }
-            updateObject[`users/feed/nearby/${userId}`] = nearbyStories;
-
-            // Do a deep-path update
-            return database.ref().update(updateObject).then(error => {
-                if (error) {
-                    console.log("Error updating data:", error);
-                }
-            }).catch(function (error) {
-                console.log("Promise rejected: " + error);
-            });
-        });
-    })
-
-
-
-
-
-
-
-
-
-exports.addNewPlace = functions.database.ref('/places/{placeId}/info').onWrite(event => {
-    const placeId = event.params.placeId;
-    const value = event.data.val();
-    const prevData = event.data.previous._data;
-    const newData = event.data._newData;
-
-    if (prevData != null) {
-        return
-    }
-
-    const userCoordsRef = database.ref('/users/location/coordinates/');
-    return userCoordsRef.once('value').then(snapshot => {
-
-        snapshot.forEach(function (userCoord) {
-            const userId = userCoord.key;
-            const lat = userCoord.val().lat;
-            const lon = userCoord.val().lon;
-            const rad = userCoord.val().rad;
-            const place_lat = newData.lat;
-            const place_lon = newData.lon;
-
-            const distance = utilities.haversineDistance(lat, lon, place_lat, place_lon);
-            if (distance <= rad) {
-                database.ref(`users/location/nearby/${userId}/${placeId}`).set(distance);
-            }
-        });
-    }).catch(function (error) {
-        console.log("Promise rejected: " + error);
-    });
-});
-
-exports.addPostToNearbyFeed =
-    functions.database.ref('/places/{placeId}/posts/{postKey}').onWrite(event => {
-        const placeId = event.params.placeId;
-        const postKey = event.params.postKey;
-        const value = event.data.val();
-        const newData = event.data._newData;
-        const lookupRef = database.ref(`lookups/userplace/${placeId}`);
-
-        var toRemove = false;
-        if (value == null || newData == null) {
-            toRemove = true;
-        }
-
-        return lookupRef.once('value').then(snapshot => {
-
-            var updateObject = {};
-
-            snapshot.forEach(function (user) {
-                const userId = user.key;
-                const distance = user.val();
-                const userFeedPath = `/users/feed/nearby/${userId}/${placeId}`;
-                updateObject[`${userFeedPath}/posts/${postKey}`] = (toRemove ? null : newData);
-                updateObject[`${userFeedPath}/distance`] = distance;
-            });
-
-            // Do a deep-path update
-            return database.ref().update(updateObject).then(error => {
-                if (error) {
-                    console.log("Error updating data:", error);
-                }
-            }).catch(function (error) {
-                console.log("Promise rejected: " + error);
-            });
-
-        }).catch(function (error) {
-            console.log("Promise rejected: " + error);
-        });
-    });
-
-exports.addPostToFollowingFeed = functions.database.ref('/users/story/{uid}/posts/{postKey}').onWrite(event => {
-    const userId = event.params.uid;
-    const postKey = event.params.postKey;
-    const value = event.data.val();
-    const newData = event.data._newData;
-
-    var toRemove = false;
-    if (value == null || newData == null) {
-        toRemove = true;
-    }
-
-    const followersRef = database.ref(`users/social/followers/${userId}`);
-
-    return followersRef.once('value').then(snapshot => {
-        var updateObject = {};
-
-        snapshot.forEach(function (user) {
-            const followerId = user.key;
-            const path = `/users/feed/following/${followerId}/${userId}/${postKey}`;
-            updateObject[path] = (toRemove ? null : newData);
-        });
-
-        // Do a deep-path update
-        return database.ref().update(updateObject).then(error => {
-            if (error) {
-                console.log("Error updating data:", error);
-            }
-        }).catch(function (error) {
-            console.log("Promise rejected: " + error);
-        });
     }).catch(function (error) {
         console.log("Promise rejected: " + error);
     });
@@ -697,8 +589,6 @@ exports.conversationMetaUpdate = functions.database.ref('/conversations/{convers
     const uidA = uids[0];
     const uidB = uids[1];
 
-
-    console.log("newData: ", newData);
     var lastSeenA = newData[uidA];
     const lastSeenB = newData[uidB];
     const lastMessage = newData.latest;
@@ -763,65 +653,105 @@ exports.sendMessageNotification = functions.database.ref('/conversations/{conver
 
     const promises = [
         event.data.adminRef.parent.parent.child("meta").update(metaObject),
-        database.ref(`/users/profile/${senderId}/username/`).once('value'),
-        database.ref(`/users/FCMToken/${recipientId}`).once('value'),
+        database.ref(`/users/settings/${recipientId}/push_notifications`).once('value')
     ];
 
     return Promise.all(promises).then(results => {
-        const metaResults = results[0];
-        const username = results[1].val();
-        const token = results[2].val();
+        const settings = results[1];
 
-        console.log("Meta: ", metaResults, " username: ", username, " token: ", token);
+        if (settings.exists() && !settings.val()) {
+            return
+        }
+        const getSenderUsername = database.ref(`/users/profile/${senderId}/username`).once('value');
+        const getRecipientToken = database.ref(`/users/FCMToken/${recipientId}`).once('value');
 
-        const pushNotificationPayload = {
-            notification: {
-                body: `${username}: ${text}`
-            }
-        };
+        return Promise.all([getSenderUsername, getRecipientToken]).then(results => {
+            const username = results[0].val();
+            const token = results[1].val();
 
-        const sendPushNotification = admin.messaging().sendToDevice(token, pushNotificationPayload);
-        return sendPushNotification.then(pushResult => {
+            const pushNotificationPayload = {
+                notification: {
+                    body: `${username}: ${text}`
+                }
+            };
 
-        }).catch(function (error) {
-            console.log("Promise rejected: " + error);
+            const sendPushNotification = admin.messaging().sendToDevice(token, pushNotificationPayload);
+            return sendPushNotification.then(pushResult => {
+
+            }).catch(function (error) {
+                console.log("Promise rejected: " + error);
+            });
         });
-
     }).catch(function (error) {
         console.log("Promise rejected: " + error);
     });
 });
 
-exports.updateStoryMeta = functions.database.ref('/users/story/{uid}/posts/{postKey}').onWrite(event => {
+exports.updateStoryMeta = functions.database.ref('/stories/stats/users/{uid}/posts/{postKey}').onWrite(event => {
     const uid = event.params.uid;
     const postKey = event.params.postKey;
 
-    const getStoryPostsPromise = database.ref(`/users/story/${uid}/posts`).once('value');
+    const value = event.data.value;
+    const getStoryPostsPromise = database.ref(`/stories/stats/users/${uid}/posts`).once('value');
+
     return getStoryPostsPromise.then(snapshot => {
+
+        if (!snapshot.exists()) {
+            const removeStory = database.ref(`stories/users/${uid}`).remove();
+            const removePopularity = database.ref(`stories/sorted/popular/userStories/${uid}`).remove();
+            const removeRecent = database.ref(`stories/sorted/recent/userStories/${uid}`).remove();
+            const removeCoordinates = database.ref(`stories/sorted/coordinates/${uid}`).remove();
+            return Promise.all([removeStory, removePopularity, removeRecent, removeCoordinates]);
+        }
 
         var totalNumComments = 0;
         var numPosts = 0;
 
         var allParticipants = {};
         var allViewers = {};
+
+        var postKeys = [];
+
+        var mostRecentKey = "";
+        var mostRecentTimestamp = 0;
+        var mostRecentCoords = {};
+
         snapshot.forEach(function (post) {
             const val = post.val();
+            mostRecentKey = post.key;
+            postKeys[post.key] = true;
             numPosts += 1;
             Object.assign(allParticipants, val.p);
             Object.assign(allViewers, val.v);
+            mostRecentTimestamp = val.t;
+            mostRecentCoords = {
+                "lat": val.lat,
+                "lon": val.lon
+            };
         });
-        
+
         const totalNumParticipants = Object.keys(allParticipants).length;
         const totalNumViews = Object.keys(allViewers).length;
-        
+
         const score = utilities.calculateUserStoryPopularityScore(numPosts, totalNumViews, totalNumParticipants);
-        
-        var metaObject = {};
-        metaObject[`/stories/sorted/popular/userStories/${uid}`] = score;
-        metaObject[`/stories/users/${uid}/meta/p`] = score;
-        const updateMetaPromise = database.ref().update(metaObject);
-        return updateMetaPromise.then( result => {
-            
+
+        const metaObject = {
+            "meta": {
+                "k": mostRecentKey,
+                "p": score,
+                "t": mostRecentTimestamp
+            },
+            "posts": postKeys
+        }
+
+        const setStoryMeta = database.ref(`stories/users/${uid}/`).set(metaObject);
+        const setPopularity = database.ref(`stories/sorted/popular/userStories/${uid}`).set(score);
+        const setRecent = database.ref(`stories/sorted/recent/userStories/${uid}`).set(mostRecentTimestamp);
+        const setCoordinates = database.ref(`stories/sorted/coordinates/${uid}`).set(mostRecentCoords);
+
+        return Promise.all([setStoryMeta, setPopularity, setRecent, setCoordinates]).then(result => {
+
+            return database.ref(`operational/refresh/${uid}`).set(true);
         }).catch(error => {
             console.log("Promise rejected: " + error);
         });
@@ -830,8 +760,70 @@ exports.updateStoryMeta = functions.database.ref('/users/story/{uid}/posts/{post
 
 });
 
+exports.updatePlaceMeta = functions.database.ref('/stories/stats/places/{placeId}/posts/{postKey}').onWrite(event => {
+    const placeId = event.params.placeId;
+    const postKey = event.params.postKey;
+
+    const getPlacesPostsPromise = database.ref(`/stories/stats/places/${placeId}/posts/`).once('value');
+    return getPlacesPostsPromise.then(snapshot => {
+
+        if (!snapshot.exists()) {
+            const removeStory = database.ref(`stories/places/${placeId}`).remove();
+            const removePopularity = database.ref(`stories/sorted/popular/places/${placeId}`).remove();
+            const removeRecent = database.ref(`stories/sorted/recent/places/${placeId}`).remove();
+
+            return Promise.all([removeStory, removePopularity, removeRecent]);
+        }
+
+        var totalNumComments = 0;
+        var numPosts = 0;
+
+        var allParticipants = {};
+        var allViewers = {};
+
+        var postKeys = [];
+
+        var mostRecentKey = "";
+        var mostRecentTimestamp = 0;
+
+        snapshot.forEach(function (post) {
+            const val = post.val();
+            mostRecentKey = post.key;
+            postKeys[post.key] = true;
+            numPosts += 1;
+            Object.assign(allParticipants, val.p);
+            Object.assign(allViewers, val.v);
+            mostRecentTimestamp = val.t;
+        });
 
 
+        const totalNumParticipants = Object.keys(allParticipants).length;
+        const totalNumViews = Object.keys(allViewers).length;
+
+        const score = utilities.calculatePlaceStoryPopularityScore(numPosts, totalNumViews, totalNumParticipants);
+
+        const metaObject = {
+            "meta": {
+                "k": mostRecentKey,
+                "p": score,
+                "t": mostRecentTimestamp
+            },
+            "posts": postKeys
+        }
+
+        const setStoryMeta = database.ref(`stories/places/${placeId}/`).set(metaObject);
+        const setPopularity = database.ref(`stories/sorted/popular/places/${placeId}`).set(score);
+        const setRecent = database.ref(`stories/sorted/recent/places/${placeId}`).set(mostRecentTimestamp);
+
+        return Promise.all([setStoryMeta, setPopularity, setRecent]).then(result => {
+
+        }).catch(error => {
+            console.log("Promise rejected: " + error);
+        });
+
+    });
+
+});
 
 
 

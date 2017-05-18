@@ -37,3 +37,7 @@ exports.extractMentions = function(text) {
 exports.calculateUserStoryPopularityScore = function(numPosts, numViews, numParticipants) {
     return numPosts + numViews * 2.0 + numParticipants * 3.0
 }
+
+exports.calculatePlaceStoryPopularityScore = function(numPosts, numViews, numParticipants) {
+    return numPosts * 2.0 + numViews * 2.0 + numParticipants * 3.0
+}
