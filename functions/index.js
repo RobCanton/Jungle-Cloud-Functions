@@ -95,17 +95,15 @@ function clearViews(postKey) {
  */
 
 
-exports.sendFollowerNotification = functions.database.ref('/users/social/followers/{followedUid}/{followerUid}').onWrite(event => {
+exports.sendFollowerNotification = functions.database.ref('/social/following/{followerUid}/{followedUid}').onWrite(event => {
     const followerUid = event.params.followerUid;
     const followedUid = event.params.followedUid;
     const value = event.data.val();
 
     updateFollowerCounts(followerUid, followedUid);
 
-    const followerFeedRef = database.ref(`/users/feed/following/${followerUid}/${followedUid}`);
-
     if (value == null) {
-        return followerFeedRef.remove().then(error => {});
+        return database.ref(`/social/followers/${followedUid}/${followerUid}`).remove();
     }
 
     let notificationObject = {};
@@ -123,24 +121,13 @@ exports.sendFollowerNotification = functions.database.ref('/users/social/followe
 
     const promises = [
         database.ref().update(notificationObject),
-        database.ref(`/users/profile/${followerUid}/username/`).once('value'),
-        database.ref(`/stories/users/${followedUid}/posts`).once('value'),
-        database.ref(`/users/social/blocked/${followerUid}/${followedUid}`).remove(),
-        database.ref(`/users/social/blocked_by/${followedUid}/${followerUid}`).remove()
+        database.ref(`/social/blocked/${followerUid}/${followedUid}`).remove(),
+        database.ref(`/social/blocked_by/${followedUid}/${followerUid}`).remove(),
+        database.ref(`/social/followers/${followedUid}/${followerUid}`).set(false)
     ];
 
     return Promise.all(promises).then(results => {
         const setNotificationResult = results[0];
-        const username = results[1].val();
-        const followedStory = results[2].val();
-
-        const updateFollowerFeedPromise = followerFeedRef.set(followedStory);
-
-        return updateFollowerFeedPromise.then(results => {
-
-        }).catch(function (error) {
-            console.log("Promise rejected: " + error);
-        });
     }).catch(function (error) {
         console.log("Promise rejected: " + error);
     });
@@ -150,8 +137,8 @@ exports.sendFollowerNotification = functions.database.ref('/users/social/followe
 
 function updateFollowerCounts(followerUid, followedUid) {
 
-    const follower_count = database.ref(`users/social/following/${followerUid}`).once('value');
-    const followed_count = database.ref(`users/social/followers/${followedUid}`).once('value');
+    const follower_count = database.ref(`social/following/${followerUid}`).once('value');
+    const followed_count = database.ref(`social/followers/${followedUid}`).once('value');
 
     return Promise.all([follower_count, followed_count]).then(results => {
         const following = results[0];
@@ -166,21 +153,28 @@ function updateFollowerCounts(followerUid, followedUid) {
     });
 }
 
-exports.processUserBlocked = functions.database.ref('/users/social/blocked/{uid}/{blocked_uid}').onWrite(event => {
+exports.processUserBlocked = functions.database.ref('/social/blocked/{uid}/{blocked_uid}').onWrite(event => {
     const uid = event.params.uid;
     const blocked_uid = event.params.blocked_uid;
     const value = event.data.val();
 
     if (value == null) {
-        return;
+        const conv_ref_1   = database.ref(`users/conversations/${blocked_uid}/${uid}/blocked`).remove();
+        const conv_ref_2   = database.ref(`users/conversations/${uid}/${blocked_uid}/blocked`).remove();
+        return Promise.all([conv_ref_1, conv_ref_2]).then( results => {
+            
+        });
     }
 
-    const follow_ref_1 = database.ref(`users/social/followers/${uid}/${blocked_uid}`).remove();
-    const follow_ref_2 = database.ref(`users/social/following/${uid}/${blocked_uid}`).remove();
-    const follow_ref_3 = database.ref(`users/social/followers/${blocked_uid}/${uid}`).remove();
-    const follow_ref_4 = database.ref(`users/social/following/${blocked_uid}/${uid}`).remove();
+    
+    const follow_ref_1 = database.ref(`social/followers/${uid}/${blocked_uid}`).remove();
+    const follow_ref_2 = database.ref(`social/following/${uid}/${blocked_uid}`).remove();
+    const follow_ref_3 = database.ref(`social/followers/${blocked_uid}/${uid}`).remove();
+    const follow_ref_4 = database.ref(`social/following/${blocked_uid}/${uid}`).remove();
+    const conv_ref_1   = database.ref(`users/conversations/${blocked_uid}/${uid}/blocked`).set(true);
+    const conv_ref_2   = database.ref(`users/conversations/${uid}/${blocked_uid}/blocked`).set(true);
 
-    return Promise.all([follow_ref_1, follow_ref_2, follow_ref_3, follow_ref_4]).then(results => {
+    return Promise.all([follow_ref_1, follow_ref_2, follow_ref_3, follow_ref_4, conv_ref_1, conv_ref_2]).then(results => {
         console.log("Follow social removed");
 
     }).catch(function (error) {
@@ -216,7 +210,7 @@ exports.processUploads =
             "timestamp": dateCreated
         });
 
-        const followersRef = database.ref(`users/social/followers/${author}`).once('value');
+        const followersRef = database.ref(`social/followers/${author}`).once('value');
 
         return Promise.all([liveUpdate, followersRef]).then(results => {
             let liveResults = results[0];
@@ -227,7 +221,7 @@ exports.processUploads =
                 snapshot.forEach(function (follower) {
                     const followerUid = follower.key;
 
-                    const tempRef = database.ref(`users/social/stories/${followerUid}/${author}/${uploadKey}`);
+                    const tempRef = database.ref(`social/stories/${followerUid}/${author}/${uploadKey}`);
                     tempRef.set(dateCreated);
 
                 });
@@ -521,7 +515,7 @@ exports.locationUpdate = functions.database.ref('/users/location/coordinates/{ui
 
     const placesRef = database.ref('places').once('value');
     const userCoordsRef = database.ref('stories/sorted/coordinates').once('value');
-    const followingRef = database.ref(`users/social/following/${userId}/`).once('value');
+    const followingRef = database.ref(`social/following/${userId}/`).once('value');
 
     return Promise.all([followingRef, userCoordsRef, placesRef]).then(results => {
         const followingSnapshot = results[0];
@@ -600,7 +594,6 @@ exports.conversationMetaUpdate = functions.database.ref('/conversations/{convers
 
     if (lastSeenA == null || lastSeenA == undefined) {
         return database.ref(`/conversations/${conversationKey}/meta/${uidA}`).set(0).then(result => {});
-        updateObject[`/conversations/${conversationKey}/meta/${uidA}`] = 0;
     }
 
     if (lastSeenB == null || lastSeenB == undefined) {
@@ -650,6 +643,8 @@ exports.sendMessageNotification = functions.database.ref('/conversations/{conver
     metaObject[senderId] = timestamp;
     metaObject["text"] = text;
     metaObject["latest"] = timestamp;
+    metaObject["A"] = uidA;
+    metaObject["B"] = uidB;
 
     const promises = [
         event.data.adminRef.parent.parent.child("meta").update(metaObject),
