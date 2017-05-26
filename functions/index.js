@@ -820,6 +820,16 @@ exports.updatePlaceMeta = functions.database.ref('/stories/stats/places/{placeId
 
 });
 
+exports.updateUserUploadCount = functions.database.ref('/users/uploads/{uid}/{postKey}').onWrite(event => {
+    const uid = event.params.uid;
+    const value = event.data.value;
+    
+    return database.ref(`users/uploads/${uid}`).once('value').then( snapshot => {
+       
+        return database.ref(`users/profile/${uid}/posts`).set(snapshot.numChildren());
+    });
+});
+
 
 
 Array.prototype.containsAtIndex = function (v) {
