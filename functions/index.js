@@ -159,20 +159,20 @@ exports.processUserBlocked = functions.database.ref('/social/blocked/{uid}/{bloc
     const value = event.data.val();
 
     if (value == null) {
-        const conv_ref_1   = database.ref(`users/conversations/${blocked_uid}/${uid}/blocked`).remove();
-        const conv_ref_2   = database.ref(`users/conversations/${uid}/${blocked_uid}/blocked`).remove();
-        return Promise.all([conv_ref_1, conv_ref_2]).then( results => {
-            
+        const conv_ref_1 = database.ref(`users/conversations/${blocked_uid}/${uid}/blocked`).remove();
+        const conv_ref_2 = database.ref(`users/conversations/${uid}/${blocked_uid}/blocked`).remove();
+        return Promise.all([conv_ref_1, conv_ref_2]).then(results => {
+
         });
     }
 
-    
+
     const follow_ref_1 = database.ref(`social/followers/${uid}/${blocked_uid}`).remove();
     const follow_ref_2 = database.ref(`social/following/${uid}/${blocked_uid}`).remove();
     const follow_ref_3 = database.ref(`social/followers/${blocked_uid}/${uid}`).remove();
     const follow_ref_4 = database.ref(`social/following/${blocked_uid}/${uid}`).remove();
-    const conv_ref_1   = database.ref(`users/conversations/${blocked_uid}/${uid}/blocked`).set(true);
-    const conv_ref_2   = database.ref(`users/conversations/${uid}/${blocked_uid}/blocked`).set(true);
+    const conv_ref_1 = database.ref(`users/conversations/${blocked_uid}/${uid}/blocked`).set(true);
+    const conv_ref_2 = database.ref(`users/conversations/${uid}/${blocked_uid}/blocked`).set(true);
 
     return Promise.all([follow_ref_1, follow_ref_2, follow_ref_3, follow_ref_4, conv_ref_1, conv_ref_2]).then(results => {
         console.log("Follow social removed");
@@ -232,11 +232,6 @@ exports.processUploads =
 function deletePost(key, author, placeId) {
     console.log("Delete post: ", key);
 
-    if (placeId !== null || placeId !== undefined) {
-        database.ref(`stories/stats/places/${placeId}/posts/${key}`).remove();
-    }
-
-    database.ref(`stories/stats/users/${author}/posts/${key}`).remove();
     database.ref(`users/uploads/${author}/${key}`).remove();
     database.ref(`uploads/comments/${key}`).remove();
 
@@ -388,14 +383,10 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
         metaUpdateObject[`/uploads/meta/${postKey}/commenters`] = commenters.length;
 
         if (live) {
-            metaUpdateObject[`/stories/stats/users/${postAuthor}/posts/${postKey}/c`] = numComments;
-            metaUpdateObject[`/stories/stats/users/${postAuthor}/posts/${postKey}/p`] = participants;
-
-            if (placeId !== null && placeId !== undefined) {
-                metaUpdateObject[`/places/${placeId}/posts/${postKey}/c`] = numComments;
-                metaUpdateObject[`/places/${placeId}/posts/${postKey}/p`] = participants;
-            }
+            metaUpdateObject[`/uploads/stats/${postKey}/c`] = numComments;
+            metaUpdateObject[`/uploads/stats/${postKey}/p`] = participants;
         }
+
         const metaUpdatePromise = database.ref().update(metaUpdateObject);
 
         /* Write comment notifications to post author and mentioned users  */
@@ -409,7 +400,6 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
                 let subscriber_uid = subscriber.key;
 
                 if (subscriber_uid !== sender) {
-
                     let nKey = `comment:${postKey}:${subscriber_uid}`
                     let notificationRef = database.ref(`users/notifications/${subscriber_uid}/${nKey}`);
 
@@ -435,7 +425,7 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
                         "sender": sender,
                         "recipient": subscriber_uid,
                         "text": trimmedString,
-                        "commenters": count,
+                        "count": count,
                         "timestamp": admin.database.ServerValue.TIMESTAMP
                     }
 
@@ -455,6 +445,63 @@ exports.sendCommentNotification = functions.database.ref('/uploads/comments/{pos
     });
 
 
+});
+
+exports.updateLikesMeta = functions.database.ref('/uploads/likes/{postKey}/{uid}').onWrite(event => {
+    const userId = event.params.uid;
+    const postKey = event.params.postKey;
+    const value = event.data.val();
+    const newData = event.data._newData;
+
+    const postDataPromise = database.ref(`/uploads/meta/${postKey}`).once('value');
+    const postLikesPromise = database.ref(`/uploads/likes/${postKey}`).once('value');
+
+    return Promise.all([postDataPromise, postLikesPromise]).then(results => {
+        const postMeta = results[0].val();
+        const postLikes = results[1];
+        const author = postMeta.author;
+        const live = postMeta.live;
+        const placeId = postMeta.placeID;
+
+        const numLikes = postLikes.numChildren();
+
+        console.log("NumLikes: ", numLikes);
+        var metaUpdateObject = {};
+        metaUpdateObject[`/uploads/meta/${postKey}/likes`] = numLikes;
+
+        if (live && postLikes.val() !== null && postLikes.val() !== undefined) {
+            metaUpdateObject[`/uploads/stats/${postKey}/l`] = postLikes.val();
+        }
+
+        const metaUpdatePromise = database.ref().update(metaUpdateObject);
+
+        return metaUpdatePromise.then(result => {
+            var notificationObject = {};
+            let nKey = `like:${postKey}`;
+            notificationObject[`notifications/${nKey}`] = {
+                "type": 'LIKE',
+                "postKey": postKey,
+                "sender": userId,
+                "recipient": author,
+                "count": numLikes,
+                "timestamp": admin.database.ServerValue.TIMESTAMP
+            }
+
+            notificationObject[`users/notifications/${author}/${nKey}`] = false;
+
+            const notificationPromise = database.ref().update(notificationObject);
+            return notificationPromise.then(snapshot => {
+
+            }).catch(function (error) {
+                console.log("Promise rejected: " + error);
+            });
+
+        }).catch(function (error) {
+            console.log("Promise rejected: " + error);
+        });
+    }).catch(function (error) {
+        console.log("Promise rejected: " + error);
+    });
 });
 
 exports.updateViewsMeta = functions.database.ref('/uploads/views/{postKey}/{uid}').onWrite(event => {
@@ -481,11 +528,7 @@ exports.updateViewsMeta = functions.database.ref('/uploads/views/{postKey}/{uid}
         metaUpdateObject[`/uploads/meta/${postKey}/views`] = postViews.numChildren();
 
         if (live && postViews.val() !== null && postViews.val() !== undefined) {
-            metaUpdateObject[`/stories/stats/users/${author}/posts/${postKey}/v`] = postViews.val();
-
-            if (placeId !== null && placeId !== undefined) {
-                metaUpdateObject[`/stories/stats/places/${placeId}/posts/${postKey}/v`] = postViews.val();
-            }
+            metaUpdateObject[`/uploads/stats/${postKey}/v`] = postViews.val();
         }
 
         const metaUpdatePromise = database.ref().update(metaUpdateObject);
@@ -513,58 +556,23 @@ exports.locationUpdate = functions.database.ref('/users/location/coordinates/{ui
         return console.log('Location removed: ', userId);
     }
 
-    const placesRef = database.ref('places').once('value');
-    const userCoordsRef = database.ref('stories/sorted/coordinates').once('value');
-    const followingRef = database.ref(`social/following/${userId}/`).once('value');
+    const userCoordsRef = database.ref('uploads/location/').once('value');
+    return userCoordsRef.then(snapshot => {
+        var nearbyPosts = {};
 
-    return Promise.all([followingRef, userCoordsRef, placesRef]).then(results => {
-        const followingSnapshot = results[0];
-        const usersSnapshot = results[1];
-        const placesSnapshot = results[2];
+        snapshot.forEach(function (post) {
+            const postKey = post.key;
+            const post_lat = post.val().lat;
+            const post_lon = post.val().lon;
 
-        var following = {};
-        var followingWithNearbyStories = {};
-        followingSnapshot.forEach(function (user) {
-            following[user.key] = true;
-        });
-
-        var nearbyUserIds = {};
-
-        usersSnapshot.forEach(function (user) {
-            const uid = user.key;
-            const user_lat = user.val().lat;
-            const user_lon = user.val().lon;
-
-            const distance = utilities.haversineDistance(lat, lon, user_lat, user_lon);
-            if (distance <= rad && uid !== userId) {
-                nearbyUserIds[uid] = distance;
-                if (following[uid] !== null && following[uid] !== undefined) {
-                    followingWithNearbyStories[uid] = distance;
-                }
-            }
-        });
-
-        var nearbyPlaceIds = {};
-
-        placesSnapshot.forEach(function (place) {
-            const id = place.key;
-            const name = place.val().name;
-            const place_lat = place.val().info.lat;
-            const place_lon = place.val().info.lon;
-
-            const distance = utilities.haversineDistance(lat, lon, place_lat, place_lon);
+            const distance = utilities.haversineDistance(lat, lon, post_lat, post_lon);
             if (distance <= rad) {
-                nearbyPlaceIds[id] = distance;
+                nearbyPosts[postKey] = distance;
             }
         });
 
-        var nearbyUpdateObject = {};
-
-        nearbyUpdateObject[`users/location/nearby/${userId}/following`] = followingWithNearbyStories;
-        nearbyUpdateObject[`users/location/nearby/${userId}/users`] = nearbyUserIds;
-        nearbyUpdateObject[`users/location/nearby/${userId}/places`] = nearbyPlaceIds;
-        const updatePromise = database.ref().update(nearbyUpdateObject);
-        return updatePromise.then(result => {
+        const setNearbyPosts = database.ref(`users/location/nearby/${userId}/posts`).set(nearbyPosts);
+        return setNearbyPosts.then(result => {
 
         });
 
@@ -572,6 +580,7 @@ exports.locationUpdate = functions.database.ref('/users/location/coordinates/{ui
         console.log("Promise rejected: " + error);
     });
 });
+
 
 exports.conversationMetaUpdate = functions.database.ref('/conversations/{conversationKey}/meta').onWrite(event => {
     const conversationKey = event.params.conversationKey;
@@ -586,7 +595,9 @@ exports.conversationMetaUpdate = functions.database.ref('/conversations/{convers
     var lastSeenA = newData[uidA];
     const lastSeenB = newData[uidB];
     const lastMessage = newData.latest;
+    const sender = newData.sender;
     const text = newData.text;
+    const isMediaMessage = newData.isMediaMsg;
 
     console.log(`lastSeenA: ${lastSeenA} lastSeenB: ${lastSeenB} lastest: ${lastMessage} text: ${text}`);
 
@@ -604,12 +615,21 @@ exports.conversationMetaUpdate = functions.database.ref('/conversations/{convers
 
     updateObject[`users/conversations/${uidA}/${uidB}/seen`] = lastSeenA >= lastMessage;
     updateObject[`users/conversations/${uidA}/${uidB}/latest`] = lastMessage;
-    updateObject[`users/conversations/${uidA}/${uidB}/text`] = text;
+    updateObject[`users/conversations/${uidA}/${uidB}/sender`] = sender;
+    updateObject[`users/conversations/${uidA}/${uidB}/isMediaMessage`] = isMediaMessage;
 
     updateObject[`users/conversations/${uidB}/${uidA}/seen`] = lastSeenB >= lastMessage;
     updateObject[`users/conversations/${uidB}/${uidA}/latest`] = lastMessage;
-    updateObject[`users/conversations/${uidB}/${uidA}/text`] = text;
+    updateObject[`users/conversations/${uidB}/${uidA}/sender`] = sender;
+    updateObject[`users/conversations/${uidB}/${uidA}/isMediaMessage`] = isMediaMessage;
+    
+    if (text !== null && text !== undefined) {
+        updateObject[`users/conversations/${uidA}/${uidB}/text`] = text;
+        updateObject[`users/conversations/${uidB}/${uidA}/text`] = text;
+    }
+    
 
+    
     return database.ref().update(updateObject).then(result => {
 
     }).catch(function (error) {
@@ -625,6 +645,7 @@ exports.sendMessageNotification = functions.database.ref('/conversations/{conver
 
     const senderId = newData.senderId;
     const text = newData.text;
+    const uploadKey = newData.uploadKey;
     const timestamp = newData.timestamp;
     if (newData == null || timestamp == null) {
         return
@@ -641,10 +662,16 @@ exports.sendMessageNotification = functions.database.ref('/conversations/{conver
 
     var metaObject = {}
     metaObject[senderId] = timestamp;
-    metaObject["text"] = text;
+    metaObject["text"] = "";
     metaObject["latest"] = timestamp;
+    metaObject["sender"] = senderId;
     metaObject["A"] = uidA;
     metaObject["B"] = uidB;
+    metaObject["isMediaMsg"] = uploadKey !== null && uploadKey !== undefined;
+    
+    if (text !== null && text !== undefined) {
+        metaObject["text"] = text;
+    }
 
     const promises = [
         event.data.adminRef.parent.parent.child("meta").update(metaObject),
@@ -682,153 +709,61 @@ exports.sendMessageNotification = functions.database.ref('/conversations/{conver
     });
 });
 
-exports.updateStoryMeta = functions.database.ref('/stories/stats/users/{uid}/posts/{postKey}').onWrite(event => {
-    const uid = event.params.uid;
-    const postKey = event.params.postKey;
-
-    const value = event.data.value;
-    const getStoryPostsPromise = database.ref(`/stories/stats/users/${uid}/posts`).once('value');
-
-    return getStoryPostsPromise.then(snapshot => {
-
-        if (!snapshot.exists()) {
-            const removeStory = database.ref(`stories/users/${uid}`).remove();
-            const removePopularity = database.ref(`stories/sorted/popular/userStories/${uid}`).remove();
-            const removeRecent = database.ref(`stories/sorted/recent/userStories/${uid}`).remove();
-            const removeCoordinates = database.ref(`stories/sorted/coordinates/${uid}`).remove();
-            return Promise.all([removeStory, removePopularity, removeRecent, removeCoordinates]);
-        }
-
-        var totalNumComments = 0;
-        var numPosts = 0;
-
-        var allParticipants = {};
-        var allViewers = {};
-
-        var postKeys = [];
-
-        var mostRecentKey = "";
-        var mostRecentTimestamp = 0;
-        var mostRecentCoords = {};
-
-        snapshot.forEach(function (post) {
-            const val = post.val();
-            mostRecentKey = post.key;
-            postKeys[post.key] = true;
-            numPosts += 1;
-            Object.assign(allParticipants, val.p);
-            Object.assign(allViewers, val.v);
-            mostRecentTimestamp = val.t;
-            mostRecentCoords = {
-                "lat": val.lat,
-                "lon": val.lon
-            };
-        });
-
-        const totalNumParticipants = Object.keys(allParticipants).length;
-        const totalNumViews = Object.keys(allViewers).length;
-
-        const score = utilities.calculateUserStoryPopularityScore(numPosts, totalNumViews, totalNumParticipants);
-
-        const metaObject = {
-            "meta": {
-                "k": mostRecentKey,
-                "p": score,
-                "t": mostRecentTimestamp
-            },
-            "posts": postKeys
-        }
-
-        const setStoryMeta = database.ref(`stories/users/${uid}/`).set(metaObject);
-        const setPopularity = database.ref(`stories/sorted/popular/userStories/${uid}`).set(score);
-        const setRecent = database.ref(`stories/sorted/recent/userStories/${uid}`).set(mostRecentTimestamp);
-        const setCoordinates = database.ref(`stories/sorted/coordinates/${uid}`).set(mostRecentCoords);
-
-        return Promise.all([setStoryMeta, setPopularity, setRecent, setCoordinates]).then(result => {
-
-            return database.ref(`operational/refresh/${uid}`).set(true);
-        }).catch(error => {
-            console.log("Promise rejected: " + error);
-        });
-
-    });
-
-});
-
-exports.updatePlaceMeta = functions.database.ref('/stories/stats/places/{placeId}/posts/{postKey}').onWrite(event => {
-    const placeId = event.params.placeId;
-    const postKey = event.params.postKey;
-
-    const getPlacesPostsPromise = database.ref(`/stories/stats/places/${placeId}/posts/`).once('value');
-    return getPlacesPostsPromise.then(snapshot => {
-
-        if (!snapshot.exists()) {
-            const removeStory = database.ref(`stories/places/${placeId}`).remove();
-            const removePopularity = database.ref(`stories/sorted/popular/places/${placeId}`).remove();
-            const removeRecent = database.ref(`stories/sorted/recent/places/${placeId}`).remove();
-
-            return Promise.all([removeStory, removePopularity, removeRecent]);
-        }
-
-        var totalNumComments = 0;
-        var numPosts = 0;
-
-        var allParticipants = {};
-        var allViewers = {};
-
-        var postKeys = [];
-
-        var mostRecentKey = "";
-        var mostRecentTimestamp = 0;
-
-        snapshot.forEach(function (post) {
-            const val = post.val();
-            mostRecentKey = post.key;
-            postKeys[post.key] = true;
-            numPosts += 1;
-            Object.assign(allParticipants, val.p);
-            Object.assign(allViewers, val.v);
-            mostRecentTimestamp = val.t;
-        });
-
-
-        const totalNumParticipants = Object.keys(allParticipants).length;
-        const totalNumViews = Object.keys(allViewers).length;
-
-        const score = utilities.calculatePlaceStoryPopularityScore(numPosts, totalNumViews, totalNumParticipants);
-
-        const metaObject = {
-            "meta": {
-                "k": mostRecentKey,
-                "p": score,
-                "t": mostRecentTimestamp
-            },
-            "posts": postKeys
-        }
-
-        const setStoryMeta = database.ref(`stories/places/${placeId}/`).set(metaObject);
-        const setPopularity = database.ref(`stories/sorted/popular/places/${placeId}`).set(score);
-        const setRecent = database.ref(`stories/sorted/recent/places/${placeId}`).set(mostRecentTimestamp);
-
-        return Promise.all([setStoryMeta, setPopularity, setRecent]).then(result => {
-
-        }).catch(error => {
-            console.log("Promise rejected: " + error);
-        });
-
-    });
-
-});
 
 exports.updateUserUploadCount = functions.database.ref('/users/uploads/{uid}/{postKey}').onWrite(event => {
     const uid = event.params.uid;
     const value = event.data.value;
-    
-    return database.ref(`users/uploads/${uid}`).once('value').then( snapshot => {
-       
+
+    return database.ref(`users/uploads/${uid}`).once('value').then(snapshot => {
+
         return database.ref(`users/profile/${uid}/posts`).set(snapshot.numChildren());
     });
 });
+
+exports.updatePostMeta = functions.database.ref('/uploads/stats/{postKey}').onWrite(event => {
+    const postKey = event.params.postKey;
+
+    const value = event.data.val();
+
+    console.log(value);
+    const comments = value.c;
+
+    var views = 0;
+    if (value.v != null && value.v != undefined) {
+        views = Object.keys(value.v).length;
+    }
+
+    var participants = 0;
+    if (value.p != null && value.p != undefined) {
+        participants = Object.keys(value.p).length;
+    }
+
+    const popularity = utilities.calculatePostPopularityScore(views, participants);
+    console.log("POPULARITY: ", popularity);
+    const setPopularity = database.ref(`/uploads/popular/${postKey}`).set(popularity);
+    //const getPostMeta = database.ref(`/uploads/stats/${postKey}`).once('value');
+    return setPopularity.then(snapshot => {
+
+    });
+});
+
+exports.updateUsername = functions.database.ref('/users/profile/{uid}/username').onWrite(event => {
+    const uid = event.params.uid;
+    const value = event.data.val();
+
+    console.log("Username value: ", value);
+
+    if (value != null && value != undefined) {
+        const addUsernameLookupEntry = database.ref(`/users/lookup/username/${uid}`).set(value);
+        return addUsernameLookupEntry.then(snapshot => {
+
+        });
+
+    } else {
+        return
+    }
+
+})
 
 
 
@@ -851,4 +786,4 @@ Array.prototype.unique = function () {
         }
     }
     return arr;
-}
+};
